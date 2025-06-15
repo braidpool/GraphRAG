@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Unified Code Context MCP Server
 A Model Context Protocol server that provides tools to:
@@ -220,7 +221,7 @@ class ImportExtractor:
         return imports
 
 class CodeVisitor(ast.NodeVisitor):
-    """AST visitor to extract code elements with enhanced metadata"""
+    """Enhanced AST visitor to extract code elements with better function call detection"""
     
     def __init__(self, file_path: str, is_dependency: bool = False):
         self.file_path = file_path
@@ -232,6 +233,26 @@ class CodeVisitor(ast.NodeVisitor):
         self.function_calls = []
         self.current_context = None
         self.current_class = None
+        self.context_stack = []  # Track nested contexts
+    
+    def _push_context(self, name: str, node_type: str):
+        """Push a new context onto the stack"""
+        self.context_stack.append({
+            'name': name,
+            'type': node_type,
+            'previous_context': self.current_context,
+            'previous_class': self.current_class
+        })
+        self.current_context = name
+        if node_type == 'class':
+            self.current_class = name
+    
+    def _pop_context(self):
+        """Pop the current context from the stack"""
+        if self.context_stack:
+            prev_context = self.context_stack.pop()
+            self.current_context = prev_context['previous_context']
+            self.current_class = prev_context['previous_class']
     
     def visit_FunctionDef(self, node):
         """Visit function definitions"""
@@ -248,12 +269,21 @@ class CodeVisitor(ast.NodeVisitor):
             'decorators': [ast.unparse(dec) if hasattr(ast, 'unparse') else '' for dec in node.decorator_list]
         }
         
-        prev_context = self.current_context
-        self.current_context = node.name
         self.functions.append(func_data)
         
+        # Push function context
+        self._push_context(node.name, 'function')
+        
+        # Visit child nodes
         self.generic_visit(node)
-        self.current_context = prev_context
+        
+        # Pop function context
+        self._pop_context()
+    
+    def visit_AsyncFunctionDef(self, node):
+        """Visit async function definitions"""
+        # Handle async functions the same way as regular functions
+        self.visit_FunctionDef(node)
     
     def visit_ClassDef(self, node):
         """Visit class definitions"""
@@ -269,16 +299,16 @@ class CodeVisitor(ast.NodeVisitor):
             'decorators': [ast.unparse(dec) if hasattr(ast, 'unparse') else '' for dec in node.decorator_list]
         }
         
-        prev_context = self.current_context
-        prev_class = self.current_class
-        self.current_context = node.name
-        self.current_class = node.name
         self.classes.append(class_data)
         
+        # Push class context
+        self._push_context(node.name, 'class')
+        
+        # Visit child nodes
         self.generic_visit(node)
         
-        self.current_context = prev_context
-        self.current_class = prev_class
+        # Pop class context
+        self._pop_context()
     
     def visit_Assign(self, node):
         """Visit variable assignments"""
@@ -293,6 +323,32 @@ class CodeVisitor(ast.NodeVisitor):
                     'is_dependency': self.is_dependency
                 }
                 self.variables.append(var_data)
+            elif isinstance(target, ast.Attribute):
+                # Handle attribute assignments like self.var = value
+                var_data = {
+                    'name': target.attr,
+                    'line_number': node.lineno,
+                    'value': ast.unparse(node.value) if hasattr(ast, 'unparse') else '',
+                    'context': self.current_context,
+                    'class_context': self.current_class,
+                    'is_dependency': self.is_dependency
+                }
+                self.variables.append(var_data)
+        
+        self.generic_visit(node)
+    
+    def visit_AnnAssign(self, node):
+        """Visit annotated assignments (type hints)"""
+        if isinstance(node.target, ast.Name):
+            var_data = {
+                'name': node.target.id,
+                'line_number': node.lineno,
+                'value': ast.unparse(node.value) if node.value and hasattr(ast, 'unparse') else '',
+                'context': self.current_context,
+                'class_context': self.current_class,
+                'is_dependency': self.is_dependency
+            }
+            self.variables.append(var_data)
         
         self.generic_visit(node)
     
@@ -325,30 +381,133 @@ class CodeVisitor(ast.NodeVisitor):
         self.generic_visit(node)
     
     def visit_Call(self, node):
-        """Visit function calls"""
+        """Visit function calls with enhanced detection for static methods and object methods"""
+        call_name = None
+        call_args = []
+        full_call_name = None  # Store the full call name for better matching
+        
+        # Extract arguments
+        try:
+            call_args = [ast.unparse(arg) if hasattr(ast, 'unparse') else '' for arg in node.args]
+        except:
+            call_args = []
+        
+        # Determine the function being called
         if isinstance(node.func, ast.Name):
-            call_data = {
-                'name': node.func.id,
-                'line_number': node.lineno,
-                'args': [ast.unparse(arg) if hasattr(ast, 'unparse') else '' for arg in node.args],
-                'context': self.current_context,
-                'is_dependency': self.is_dependency
-            }
-            self.function_calls.append(call_data)
+            # Direct function call: func()
+            call_name = node.func.id
+            full_call_name = call_name
         elif isinstance(node.func, ast.Attribute):
-            call_data = {
-                'name': f"{ast.unparse(node.func.value) if hasattr(ast, 'unparse') else ''}.{node.func.attr}",
-                'line_number': node.lineno,
-                'args': [ast.unparse(arg) if hasattr(ast, 'unparse') else '' for arg in node.args],
-                'context': self.current_context,
-                'is_dependency': self.is_dependency
+            # Method call: obj.method() or module.func()
+            if isinstance(node.func.value, ast.Name):
+                # obj.method() or ClassName.static_method()
+                object_name = node.func.value.id
+                method_name = node.func.attr
+                call_name = method_name
+                full_call_name = f"{object_name}.{method_name}"
+            elif isinstance(node.func.value, ast.Attribute):
+                # nested.obj.method() like self.import_extractor.extract_python_imports()
+                try:
+                    base_name = ast.unparse(node.func.value) if hasattr(ast, 'unparse') else ''
+                    method_name = node.func.attr
+                    call_name = method_name
+                    full_call_name = f"{base_name}.{method_name}"
+                except:
+                    call_name = node.func.attr
+                    full_call_name = call_name
+            else:
+                call_name = node.func.attr
+                full_call_name = call_name
+        elif isinstance(node.func, ast.Subscript):
+            # Function call with subscript: func[key]()
+            try:
+                call_name = ast.unparse(node.func) if hasattr(ast, 'unparse') else ''
+                full_call_name = call_name
+            except:
+                call_name = 'subscript_call'
+                full_call_name = call_name
+        
+        if call_name:
+            # Filter out built-in functions and common patterns
+            builtin_functions = {
+                'print', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
+                'range', 'enumerate', 'zip', 'map', 'filter', 'sorted', 'sum', 'min', 'max',
+                'abs', 'round', 'isinstance', 'hasattr', 'getattr', 'setattr', 'delattr',
+                'type', 'super', 'property', 'staticmethod', 'classmethod', 'open', 'input'
             }
-            self.function_calls.append(call_data)
+            
+            # Extract just the function name for built-in check
+            simple_name = call_name.split('.')[-1] if '.' in call_name else call_name
+            
+            if simple_name not in builtin_functions:
+                call_data = {
+                    'name': call_name,  # Just the method/function name
+                    'full_name': full_call_name,  # Full call path like "self.import_extractor.extract_python_imports"
+                    'line_number': node.lineno,
+                    'args': call_args,
+                    'context': self.current_context,
+                    'class_context': self.current_class,
+                    'is_dependency': self.is_dependency
+                }
+                self.function_calls.append(call_data)
         
         self.generic_visit(node)
+    
+    def visit_Lambda(self, node):
+        """Visit lambda expressions"""
+        # Lambdas can contain function calls too
+        lambda_name = f"lambda_line_{node.lineno}"
+        
+        # Push lambda context
+        self._push_context(lambda_name, 'lambda')
+        
+        # Visit the lambda body
+        self.generic_visit(node)
+        
+        # Pop lambda context
+        self._pop_context()
+    
+    def visit_ListComp(self, node):
+        """Visit list comprehensions"""
+        # List comprehensions can contain function calls
+        comp_name = f"listcomp_line_{node.lineno}"
+        
+        # Push comprehension context
+        self._push_context(comp_name, 'comprehension')
+        
+        # Visit the comprehension
+        self.generic_visit(node)
+        
+        # Pop comprehension context
+        self._pop_context()
+    
+    def visit_DictComp(self, node):
+        """Visit dictionary comprehensions"""
+        comp_name = f"dictcomp_line_{node.lineno}"
+        
+        self._push_context(comp_name, 'comprehension')
+        self.generic_visit(node)
+        self._pop_context()
+    
+    def visit_SetComp(self, node):
+        """Visit set comprehensions"""
+        comp_name = f"setcomp_line_{node.lineno}"
+        
+        self._push_context(comp_name, 'comprehension')
+        self.generic_visit(node)
+        self._pop_context()
+    
+    def visit_GeneratorExp(self, node):
+        """Visit generator expressions"""
+        gen_name = f"genexp_line_{node.lineno}"
+        
+        self._push_context(gen_name, 'generator')
+        self.generic_visit(node)
+        self._pop_context()
+
 
 class GraphBuilder:
-    """Module for building and managing Neo4j graphs"""
+    """Module for building and managing Neo4j graphs with proper relationships"""
     
     def __init__(self, neo4j_uri: str = None, neo4j_user: str = None, neo4j_password: str = None):
         # Validate credentials
@@ -371,20 +530,22 @@ class GraphBuilder:
                 session.run("CREATE CONSTRAINT file_path IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE")
                 session.run("CREATE CONSTRAINT function_unique IF NOT EXISTS FOR (f:Function) REQUIRE (f.name, f.file_path, f.line_number) IS UNIQUE")
                 session.run("CREATE CONSTRAINT class_unique IF NOT EXISTS FOR (c:Class) REQUIRE (c.name, c.file_path, c.line_number) IS UNIQUE")
+                session.run("CREATE CONSTRAINT variable_unique IF NOT EXISTS FOR (v:Variable) REQUIRE (v.name, v.file_path, v.line_number) IS UNIQUE")
+                session.run("CREATE CONSTRAINT module_name IF NOT EXISTS FOR (m:Module) REQUIRE m.name IS UNIQUE")
                 
-                # Create indexes
+                # Create indexes for performance
                 session.run("CREATE INDEX file_name IF NOT EXISTS FOR (f:File) ON (f.name)")
                 session.run("CREATE INDEX function_name IF NOT EXISTS FOR (f:Function) ON (f.name)")
                 session.run("CREATE INDEX class_name IF NOT EXISTS FOR (c:Class) ON (c.name)")
                 session.run("CREATE INDEX variable_name IF NOT EXISTS FOR (v:Variable) ON (v.name)")
-                session.run("CREATE INDEX module_name IF NOT EXISTS FOR (m:Module) ON (m.name)")
+                session.run("CREATE INDEX module_name_idx IF NOT EXISTS FOR (m:Module) ON (m.name)")
                 
-                # Create indexes for is_dependency on specific node types
+                # Create indexes for dependency tracking
                 session.run("CREATE INDEX function_dependency IF NOT EXISTS FOR (f:Function) ON (f.is_dependency)")
                 session.run("CREATE INDEX class_dependency IF NOT EXISTS FOR (c:Class) ON (c.is_dependency)")
                 session.run("CREATE INDEX file_dependency IF NOT EXISTS FOR (f:File) ON (f.is_dependency)")
-                session.run("CREATE INDEX variable_dependency IF NOT EXISTS FOR (v:Variable) ON (v.is_dependency)")
                 session.run("CREATE INDEX repository_dependency IF NOT EXISTS FOR (r:Repository) ON (r.is_dependency)")
+                
             except Exception as e:
                 logger.warning(f"Schema creation warning: {e}")
     
@@ -398,14 +559,14 @@ class GraphBuilder:
         total_files = len(python_files)
         
         # Estimate based on file size and complexity
-        # Base time: 0.1 seconds per file
-        # Additional time based on file size: 0.001 seconds per KB
-        estimated_time = total_files * 0.1
+        # Base time: 0.15 seconds per file (increased due to relationship creation)
+        # Additional time based on file size: 0.002 seconds per KB
+        estimated_time = total_files * 0.15
         
         for file_path in python_files[:10]:  # Sample first 10 files for size estimation
             try:
                 file_size_kb = file_path.stat().st_size / 1024
-                estimated_time += file_size_kb * 0.001
+                estimated_time += file_size_kb * 0.002
             except:
                 continue
         
@@ -454,41 +615,46 @@ class GraphBuilder:
         with self.driver.session() as session:
             session.run("""
                 MERGE (r:Repository {name: $name})
-                SET r.path = $path, r.is_dependency = $is_dependency
-            """, name=repo_name, path=str(repo_path), is_dependency=is_dependency)
+                SET r.path = $path, 
+                    r.url = $url,
+                    r.is_dependency = $is_dependency
+            """, name=repo_name, path=str(repo_path), url=None, is_dependency=is_dependency)
     
     def add_file_to_graph(self, file_data: Dict, repo_name: str):
-        """Add file and its elements to Neo4j graph"""
+        """Add file and its elements to Neo4j graph with proper relationships"""
         file_path = file_data['file_path']
         file_name = Path(file_path).name
+        relative_path = str(Path(file_path).relative_to(Path(file_path).parent.parent))
         is_dependency = file_data.get('is_dependency', False)
         
         with self.driver.session() as session:
-            # Create file node
+            # Create file node and CONTAINS relationship from Repository
             session.run("""
                 MATCH (r:Repository {name: $repo_name})
                 MERGE (f:File {path: $path})
-                SET f.name = $name, f.is_dependency = $is_dependency
+                SET f.name = $name, 
+                    f.relative_path = $relative_path,
+                    f.is_dependency = $is_dependency
                 MERGE (r)-[:CONTAINS]->(f)
-            """, repo_name=repo_name, path=file_path, name=file_name, is_dependency=is_dependency)
+            """, repo_name=repo_name, path=file_path, name=file_name, 
+                relative_path=relative_path, is_dependency=is_dependency)
             
-            # Add functions
+            # Add functions with CONTAINS relationships
             for func in file_data['functions']:
                 session.run("""
                     MATCH (f:File {path: $file_path})
-                    MERGE (func:Function {name: $name, file_path: $file_path, line_number: $line_number})
-                    SET func.end_line = $end_line,
-                        func.args = $args,
-                        func.source = $source,
-                        func.context = $context,
-                        func.class_context = $class_context,
-                        func.is_dependency = $is_dependency,
-                        func.docstring = $docstring,
-                        func.decorators = $decorators
-                    MERGE (f)-[:CONTAINS]->(func)
+                    MERGE (fn:Function {name: $name, file_path: $file_path, line_number: $line_number})
+                    SET fn.end_line = $end_line,
+                        fn.args = $args,
+                        fn.source = $source,
+                        fn.context = $context,
+                        fn.is_dependency = $is_dependency,
+                        fn.docstring = $docstring,
+                        fn.decorators = $decorators
+                    MERGE (f)-[:CONTAINS]->(fn)
                 """, file_path=file_path, **func)
             
-            # Add classes
+            # Add classes with CONTAINS relationships
             for cls in file_data['classes']:
                 session.run("""
                     MATCH (f:File {path: $file_path})
@@ -503,26 +669,125 @@ class GraphBuilder:
                     MERGE (f)-[:CONTAINS]->(c)
                 """, file_path=file_path, **cls)
             
-            # Add variables
+            # Create INHERITS_FROM relationships for classes
+            for cls in file_data['classes']:
+                for base_class in cls.get('bases', []):
+                    if base_class and not base_class.startswith('('):  # Filter out complex expressions
+                        session.run("""
+                            MATCH (child:Class {name: $child_name, file_path: $file_path})
+                            MATCH (parent:Class {name: $parent_name})
+                            MERGE (child)-[:INHERITS_FROM]->(parent)
+                        """, child_name=cls['name'], file_path=file_path, parent_name=base_class)
+            
+            # Add variables with CONTAINS relationships
             for var in file_data['variables']:
                 session.run("""
                     MATCH (f:File {path: $file_path})
                     MERGE (v:Variable {name: $name, file_path: $file_path, line_number: $line_number})
                     SET v.value = $value,
                         v.context = $context,
-                        v.class_context = $class_context,
                         v.is_dependency = $is_dependency
                     MERGE (f)-[:CONTAINS]->(v)
                 """, file_path=file_path, **var)
+                
+                # Create CONTAINS relationships from functions/classes to variables
+                if var.get('context'):
+                    # Check if context is a function
+                    session.run("""
+                        MATCH (v:Variable {name: $var_name, file_path: $file_path, line_number: $var_line})
+                        MATCH (fn:Function {name: $context_name, file_path: $file_path})
+                        MERGE (fn)-[:CONTAINS]->(v)
+                    """, var_name=var['name'], file_path=file_path, 
+                        var_line=var['line_number'], context_name=var['context'])
+                    
+                    # Check if context is a class
+                    session.run("""
+                        MATCH (v:Variable {name: $var_name, file_path: $file_path, line_number: $var_line})
+                        MATCH (c:Class {name: $context_name, file_path: $file_path})
+                        MERGE (c)-[:CONTAINS]->(v)
+                    """, var_name=var['name'], file_path=file_path,
+                        var_line=var['line_number'], context_name=var['context'])
             
-            # Add imports
+            # Add modules and IMPORTS relationships
             for imp in file_data['imports']:
                 session.run("""
                     MATCH (f:File {path: $file_path})
                     MERGE (m:Module {name: $name})
-                    SET m.alias = $alias, m.is_dependency = $is_dependency
+                    SET m.alias = $alias
                     MERGE (f)-[:IMPORTS]->(m)
                 """, file_path=file_path, **imp)
+            
+            # Create CALLS relationships between functions
+            self._create_function_calls(session, file_data)
+            
+            # Create CONTAINS relationships for class methods
+            self._create_class_method_relationships(session, file_data)
+    
+    def _create_function_calls(self, session, file_data: Dict):
+        """Create CALLS relationships between functions based on function_calls data with improved matching"""
+        file_path = file_data['file_path']
+        
+        for call in file_data.get('function_calls', []):
+            caller_context = call.get('context')
+            called_name = call['name']
+            full_call_name = call.get('full_name', called_name)
+            line_number = call['line_number']
+            
+            # Skip built-in functions and common patterns
+            if called_name in ['print', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple']:
+                continue
+                
+            if caller_context:
+                # Strategy 1: Try exact match with the called function name
+                session.run("""
+                    MATCH (caller:Function {name: $caller_name, file_path: $file_path})
+                    MATCH (called:Function {name: $called_name})
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                """, 
+                caller_name=caller_context,
+                file_path=file_path,
+                called_name=called_name,
+                line_number=line_number,
+                args=call.get('args', []),
+                full_call_name=full_call_name)
+                
+                # Strategy 2: For method calls like "self.import_extractor.extract_python_imports"
+                # Also try to match against static methods in classes
+                if '.' in full_call_name:
+                    parts = full_call_name.split('.')
+                    if len(parts) >= 2:
+                        # Try to find the method in any class
+                        method_name = parts[-1]  # Last part is the method name
+                        
+                        session.run("""
+                            MATCH (caller:Function {name: $caller_name, file_path: $file_path})
+                            MATCH (called:Function {name: $method_name})
+                            WHERE called.name = $method_name
+                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, call_type: 'method'}]->(called)
+                        """, 
+                        caller_name=caller_context,
+                        file_path=file_path,
+                        method_name=method_name,
+                        line_number=line_number,
+                        args=call.get('args', []),
+                        full_call_name=full_call_name)
+    
+    def _create_class_method_relationships(self, session, file_data: Dict):
+        """Create CONTAINS relationships from classes to their methods"""
+        file_path = file_data['file_path']
+        
+        for func in file_data.get('functions', []):
+            class_context = func.get('class_context')
+            if class_context:
+                session.run("""
+                    MATCH (c:Class {name: $class_name, file_path: $file_path})
+                    MATCH (fn:Function {name: $func_name, file_path: $file_path, line_number: $func_line})
+                    MERGE (c)-[:CONTAINS]->(fn)
+                """, 
+                class_name=class_context,
+                file_path=file_path,
+                func_name=func['name'],
+                func_line=func['line_number'])
     
     async def build_graph_from_path_async(self, path: Path, is_dependency: bool = False, job_manager: JobManager = None, job_id: str = None) -> Dict[str, Any]:
         """Build Neo4j graph from a given path asynchronously with progress tracking"""
@@ -620,7 +885,7 @@ class GraphBuilder:
         self.driver.close()
 
 class CodeFinder:
-    """Module for finding relevant code snippets based on queries"""
+    """Module for finding relevant code snippets using proper relationship traversal"""
     
     def __init__(self, neo4j_uri: str = None, neo4j_user: str = None, neo4j_password: str = None):
         # Use provided credentials or fall back to environment variables
@@ -727,6 +992,490 @@ class CodeFinder:
         
         return results
     
+    def who_calls_function(self, function_name: str, file_path: str = None) -> List[Dict]:
+        """Find what functions call a specific function using CALLS relationships with improved matching"""
+        with self.driver.session() as session:
+            if file_path:
+                # First try exact match
+                result = session.run("""
+                    MATCH (target:Function {name: $function_name, file_path: $file_path})
+                    MATCH (caller:Function)-[call:CALLS]->(target)
+                    OPTIONAL MATCH (caller_file:File)-[:CONTAINS]->(caller)
+                    RETURN DISTINCT
+                        caller.name as caller_function,
+                        caller.file_path as caller_file_path,
+                        caller.line_number as caller_line_number,
+                        caller.docstring as caller_docstring,
+                        caller.is_dependency as caller_is_dependency,
+                        call.line_number as call_line_number,
+                        call.args as call_args,
+                        call.full_call_name as full_call_name,
+                        call.call_type as call_type,
+                        target.file_path as target_file_path
+                    ORDER BY caller.is_dependency ASC, caller.file_path, caller.line_number
+                    LIMIT 20
+                """, function_name=function_name, file_path=file_path)
+                
+                # If no results, try without file path restriction
+                results = [dict(record) for record in result]
+                if not results:
+                    result = session.run("""
+                        MATCH (target:Function {name: $function_name})
+                        MATCH (caller:Function)-[call:CALLS]->(target)
+                        OPTIONAL MATCH (caller_file:File)-[:CONTAINS]->(caller)
+                        RETURN DISTINCT
+                            caller.name as caller_function,
+                            caller.file_path as caller_file_path,
+                            caller.line_number as caller_line_number,
+                            caller.docstring as caller_docstring,
+                            caller.is_dependency as caller_is_dependency,
+                            call.line_number as call_line_number,
+                            call.args as call_args,
+                            call.full_call_name as full_call_name,
+                            call.call_type as call_type,
+                            target.file_path as target_file_path
+                        ORDER BY caller.is_dependency ASC, caller.file_path, caller.line_number
+                        LIMIT 20
+                    """, function_name=function_name)
+                    results = [dict(record) for record in result]
+            else:
+                result = session.run("""
+                    MATCH (target:Function {name: $function_name})
+                    MATCH (caller:Function)-[call:CALLS]->(target)
+                    OPTIONAL MATCH (caller_file:File)-[:CONTAINS]->(caller)
+                    RETURN DISTINCT
+                        caller.name as caller_function,
+                        caller.file_path as caller_file_path,
+                        caller.line_number as caller_line_number,
+                        caller.docstring as caller_docstring,
+                        caller.is_dependency as caller_is_dependency,
+                        call.line_number as call_line_number,
+                        call.args as call_args,
+                        call.full_call_name as full_call_name,
+                        call.call_type as call_type,
+                        target.file_path as target_file_path
+                    ORDER BY caller.is_dependency ASC, caller.file_path, caller.line_number
+                    LIMIT 20
+                """, function_name=function_name)
+                results = [dict(record) for record in result]
+            
+            return results
+    
+    def what_does_function_call(self, function_name: str, file_path: str = None) -> List[Dict]:
+        """Find what functions a specific function calls using CALLS relationships"""
+        with self.driver.session() as session:
+            if file_path:
+                result = session.run("""
+                    MATCH (caller:Function {name: $function_name, file_path: $file_path})
+                    MATCH (caller)-[call:CALLS]->(called:Function)
+                    OPTIONAL MATCH (called_file:File)-[:CONTAINS]->(called)
+                    RETURN DISTINCT
+                        called.name as called_function,
+                        called.file_path as called_file_path,
+                        called.line_number as called_line_number,
+                        called.docstring as called_docstring,
+                        called.is_dependency as called_is_dependency,
+                        call.line_number as call_line_number,
+                        call.args as call_args,
+                        call.full_call_name as full_call_name,
+                        call.call_type as call_type
+                    ORDER BY called.is_dependency ASC, called.name
+                    LIMIT 20
+                """, function_name=function_name, file_path=file_path)
+            else:
+                result = session.run("""
+                    MATCH (caller:Function {name: $function_name})
+                    MATCH (caller)-[call:CALLS]->(called:Function)
+                    OPTIONAL MATCH (called_file:File)-[:CONTAINS]->(called)
+                    RETURN DISTINCT
+                        called.name as called_function,
+                        called.file_path as called_file_path,
+                        called.line_number as called_line_number,
+                        called.docstring as called_docstring,
+                        called.is_dependency as called_is_dependency,
+                        call.line_number as call_line_number,
+                        call.args as call_args,
+                        call.full_call_name as full_call_name,
+                        call.call_type as call_type
+                    ORDER BY called.is_dependency ASC, called.name
+                    LIMIT 20
+                """, function_name=function_name)
+            
+            return [dict(record) for record in result]
+    
+    def who_imports_module(self, module_name: str) -> List[Dict]:
+        """Find what files import a specific module using IMPORTS relationships"""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (file:File)-[imp:IMPORTS]->(module:Module)
+                WHERE module.name CONTAINS $module_name OR module.name = $module_name
+                OPTIONAL MATCH (repo:Repository)-[:CONTAINS]->(file)
+                RETURN DISTINCT
+                    file.name as file_name,
+                    file.path as file_path,
+                    file.relative_path as file_relative_path,
+                    module.name as imported_module,
+                    module.alias as import_alias,
+                    file.is_dependency as file_is_dependency,
+                    repo.name as repository_name
+                ORDER BY file.is_dependency ASC, file.path
+                LIMIT 20
+            """, module_name=module_name)
+            
+            return [dict(record) for record in result]
+    
+    def who_modifies_variable(self, variable_name: str) -> List[Dict]:
+        """Find what functions contain or modify a specific variable"""
+        with self.driver.session() as session:
+            # Find functions that contain the variable
+            result = session.run("""
+                MATCH (var:Variable {name: $variable_name})
+                MATCH (container)-[:CONTAINS]->(var)
+                WHERE container:Function OR container:Class OR container:File
+                OPTIONAL MATCH (file:File)-[:CONTAINS]->(container)
+                RETURN DISTINCT
+                    CASE 
+                        WHEN container:Function THEN container.name
+                        WHEN container:Class THEN container.name
+                        ELSE 'file_level'
+                    END as container_name,
+                    CASE 
+                        WHEN container:Function THEN 'function'
+                        WHEN container:Class THEN 'class'
+                        ELSE 'file'
+                    END as container_type,
+                    COALESCE(container.file_path, file.path) as file_path,
+                    container.line_number as container_line_number,
+                    var.line_number as variable_line_number,
+                    var.value as variable_value,
+                    var.context as variable_context,
+                    COALESCE(container.is_dependency, file.is_dependency, false) as is_dependency
+                ORDER BY is_dependency ASC, file_path, variable_line_number
+                LIMIT 20
+            """, variable_name=variable_name)
+            
+            return [dict(record) for record in result]
+    
+    def find_class_hierarchy(self, class_name: str) -> Dict[str, Any]:
+        """Find class inheritance relationships using INHERITS_FROM relationships"""
+        with self.driver.session() as session:
+            # Find parent classes (what this class inherits from)
+            parents_result = session.run("""
+                MATCH (child:Class {name: $class_name})-[:INHERITS_FROM]->(parent:Class)
+                OPTIONAL MATCH (parent_file:File)-[:CONTAINS]->(parent)
+                RETURN DISTINCT
+                    parent.name as parent_class,
+                    parent.file_path as parent_file_path,
+                    parent.line_number as parent_line_number,
+                    parent.docstring as parent_docstring,
+                    parent.is_dependency as parent_is_dependency
+                ORDER BY parent.is_dependency ASC, parent.name
+            """, class_name=class_name)
+            
+            # Find child classes (what inherits from this class)
+            children_result = session.run("""
+                MATCH (child:Class)-[:INHERITS_FROM]->(parent:Class {name: $class_name})
+                OPTIONAL MATCH (child_file:File)-[:CONTAINS]->(child)
+                RETURN DISTINCT
+                    child.name as child_class,
+                    child.file_path as child_file_path,
+                    child.line_number as child_line_number,
+                    child.docstring as child_docstring,
+                    child.is_dependency as child_is_dependency
+                ORDER BY child.is_dependency ASC, child.name
+            """, class_name=class_name)
+            
+            # Find methods of this class
+            methods_result = session.run("""
+                MATCH (class:Class {name: $class_name})-[:CONTAINS]->(method:Function)
+                RETURN DISTINCT
+                    method.name as method_name,
+                    method.file_path as method_file_path,
+                    method.line_number as method_line_number,
+                    method.args as method_args,
+                    method.docstring as method_docstring,
+                    method.is_dependency as method_is_dependency
+                ORDER BY method.is_dependency ASC, method.line_number
+            """, class_name=class_name)
+            
+            return {
+                "class_name": class_name,
+                "parent_classes": [dict(record) for record in parents_result],
+                "child_classes": [dict(record) for record in children_result],
+                "methods": [dict(record) for record in methods_result]
+            }
+    
+    def find_function_overrides(self, function_name: str) -> List[Dict]:
+        """Find all implementations of a function across different classes"""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (class:Class)-[:CONTAINS]->(func:Function {name: $function_name})
+                OPTIONAL MATCH (file:File)-[:CONTAINS]->(class)
+                RETURN DISTINCT
+                    class.name as class_name,
+                    class.file_path as class_file_path,
+                    func.name as function_name,
+                    func.line_number as function_line_number,
+                    func.args as function_args,
+                    func.docstring as function_docstring,
+                    func.is_dependency as is_dependency,
+                    file.name as file_name
+                ORDER BY func.is_dependency ASC, class.name
+                LIMIT 20
+            """, function_name=function_name)
+            
+            return [dict(record) for record in result]
+    
+    def find_dead_code(self) -> Dict[str, Any]:
+        """Find potentially unused functions (not called by other functions in the project)"""
+        with self.driver.session() as session:
+            # Find functions that have no incoming CALLS relationships from non-dependency code
+            result = session.run("""
+                MATCH (func:Function)
+                WHERE func.is_dependency = false
+                  AND NOT func.name IN ['main', '__init__', '__main__', 'setup', 'run', '__new__', '__del__']
+                  AND NOT func.name STARTS WITH '_test'
+                  AND NOT func.name STARTS WITH 'test_'
+                WITH func
+                OPTIONAL MATCH (caller:Function)-[:CALLS]->(func)
+                WHERE caller.is_dependency = false
+                WITH func, count(caller) as caller_count
+                WHERE caller_count = 0
+                OPTIONAL MATCH (file:File)-[:CONTAINS]->(func)
+                RETURN
+                    func.name as function_name,
+                    func.file_path as file_path,
+                    func.line_number as line_number,
+                    func.docstring as docstring,
+                    func.context as context,
+                    file.name as file_name
+                ORDER BY func.file_path, func.line_number
+                LIMIT 50
+            """)
+            
+            return {
+                "potentially_unused_functions": [dict(record) for record in result],
+                "note": "These functions might be unused, but could be entry points, callbacks, or called dynamically"
+            }
+    
+    def find_function_call_chain(self, start_function: str, end_function: str, max_depth: int = 5) -> List[Dict]:
+        """Find call chains between two functions"""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH path = shortestPath(
+                    (start:Function {name: $start_function})-[:CALLS*1..$max_depth]->(end:Function {name: $end_function})
+                )
+                WITH path, nodes(path) as func_nodes, relationships(path) as call_rels
+                RETURN 
+                    [node in func_nodes | {
+                        name: node.name,
+                        file_path: node.file_path,
+                        line_number: node.line_number,
+                        is_dependency: node.is_dependency
+                    }] as function_chain,
+                    [rel in call_rels | {
+                        call_line: rel.line_number,
+                        args: rel.args,
+                        full_call_name: rel.full_call_name
+                    }] as call_details,
+                    length(path) as chain_length
+                ORDER BY chain_length ASC
+                LIMIT 10
+            """, start_function=start_function, end_function=end_function, max_depth=max_depth)
+            
+            return [dict(record) for record in result]
+    
+    def find_module_dependencies(self, module_name: str) -> Dict[str, Any]:
+        """Find all dependencies and dependents of a module"""
+        with self.driver.session() as session:
+            # Find what files import this module
+            importers_result = session.run("""
+                MATCH (file:File)-[:IMPORTS]->(module:Module {name: $module_name})
+                OPTIONAL MATCH (repo:Repository)-[:CONTAINS]->(file)
+                RETURN DISTINCT
+                    file.name as file_name,
+                    file.path as file_path,
+                    file.is_dependency as file_is_dependency,
+                    repo.name as repository_name
+                ORDER BY file.is_dependency ASC, file.path
+                LIMIT 20
+            """, module_name=module_name)
+            
+            # Find what modules are imported by files that import this module
+            related_imports_result = session.run("""
+                MATCH (file:File)-[:IMPORTS]->(target_module:Module {name: $module_name})
+                MATCH (file)-[:IMPORTS]->(other_module:Module)
+                WHERE other_module <> target_module
+                RETURN DISTINCT
+                    other_module.name as related_module,
+                    other_module.alias as module_alias,
+                    count(file) as usage_count
+                ORDER BY usage_count DESC
+                LIMIT 20
+            """, module_name=module_name)
+            
+            return {
+                "module_name": module_name,
+                "imported_by_files": [dict(record) for record in importers_result],
+                "frequently_used_with": [dict(record) for record in related_imports_result]
+            }
+    
+    def find_variable_usage_scope(self, variable_name: str) -> Dict[str, Any]:
+        """Find the scope and usage patterns of a variable"""
+        with self.driver.session() as session:
+            # Find all instances of the variable
+            variable_instances = session.run("""
+                MATCH (var:Variable {name: $variable_name})
+                OPTIONAL MATCH (container)-[:CONTAINS]->(var)
+                WHERE container:Function OR container:Class OR container:File
+                OPTIONAL MATCH (file:File)-[:CONTAINS]->(var)
+                RETURN DISTINCT
+                    var.name as variable_name,
+                    var.value as variable_value,
+                    var.line_number as line_number,
+                    var.context as context,
+                    COALESCE(var.file_path, file.path) as file_path,
+                    CASE 
+                        WHEN container:Function THEN 'function'
+                        WHEN container:Class THEN 'class'
+                        ELSE 'module'
+                    END as scope_type,
+                    CASE 
+                        WHEN container:Function THEN container.name
+                        WHEN container:Class THEN container.name
+                        ELSE 'module_level'
+                    END as scope_name,
+                    var.is_dependency as is_dependency
+                ORDER BY var.is_dependency ASC, file_path, line_number
+            """, variable_name=variable_name)
+            
+            return {
+                "variable_name": variable_name,
+                "instances": [dict(record) for record in variable_instances]
+            }
+    
+    def analyze_code_relationships(self, query_type: str, target: str, context: str = None) -> Dict[str, Any]:
+        """Main method to analyze different types of code relationships with fixed return types"""
+        
+        query_type = query_type.lower().strip()
+        
+        try:
+            if query_type in ["who_calls", "what_calls", "callers"]:
+                results = self.who_calls_function(target, context)
+                return {
+                    "query_type": "who_calls",
+                    "target": target,
+                    "context": context,
+                    "results": results,
+                    "summary": f"Found {len(results)} functions that call '{target}'"
+                }
+            
+            elif query_type in ["what_calls", "calls_what", "dependencies"]:
+                results = self.what_does_function_call(target, context)
+                return {
+                    "query_type": "what_calls",  # Fixed: was incorrectly "who_calls"
+                    "target": target,
+                    "context": context,
+                    "results": results,
+                    "summary": f"Function '{target}' calls {len(results)} other functions"
+                }
+            
+            elif query_type in ["who_imports", "imports", "importers"]:
+                results = self.who_imports_module(target)
+                return {
+                    "query_type": "who_imports",
+                    "target": target,
+                    "results": results,
+                    "summary": f"Found {len(results)} files that import '{target}'"
+                }
+            
+            elif query_type in ["who_modifies", "modifies", "mutations", "changes", "variable_usage"]:
+                results = self.who_modifies_variable(target)
+                return {
+                    "query_type": "who_modifies",
+                    "target": target,
+                    "results": results,
+                    "summary": f"Found {len(results)} containers that hold variable '{target}'"
+                }
+            
+            elif query_type in ["class_hierarchy", "inheritance", "extends"]:
+                results = self.find_class_hierarchy(target)
+                return {
+                    "query_type": "class_hierarchy",
+                    "target": target,
+                    "results": results,
+                    "summary": f"Class '{target}' has {len(results['parent_classes'])} parents, {len(results['child_classes'])} children, and {len(results['methods'])} methods"
+                }
+            
+            elif query_type in ["overrides", "implementations", "polymorphism"]:
+                results = self.find_function_overrides(target)
+                return {
+                    "query_type": "overrides",
+                    "target": target,
+                    "results": results,
+                    "summary": f"Found {len(results)} implementations of function '{target}'"
+                }
+            
+            elif query_type in ["dead_code", "unused", "unreachable"]:
+                results = self.find_dead_code()
+                return {
+                    "query_type": "dead_code",
+                    "results": results,
+                    "summary": f"Found {len(results['potentially_unused_functions'])} potentially unused functions"
+                }
+            
+            elif query_type in ["call_chain", "path", "chain"]:
+                # For call chain, target should be "start_func->end_func"
+                if '->' in target:
+                    start_func, end_func = target.split('->', 1)
+                    results = self.find_function_call_chain(start_func.strip(), end_func.strip())
+                    return {
+                        "query_type": "call_chain",
+                        "target": target,
+                        "results": results,
+                        "summary": f"Found {len(results)} call chains from '{start_func.strip()}' to '{end_func.strip()}'"
+                    }
+                else:
+                    return {
+                        "error": "For call_chain queries, use format 'start_function->end_function'",
+                        "example": "main->process_data"
+                    }
+            
+            elif query_type in ["module_deps", "module_dependencies", "module_usage"]:
+                results = self.find_module_dependencies(target)
+                return {
+                    "query_type": "module_dependencies",
+                    "target": target,
+                    "results": results,
+                    "summary": f"Module '{target}' is imported by {len(results['imported_by_files'])} files"
+                }
+            
+            elif query_type in ["variable_scope", "var_scope", "variable_usage_scope"]:
+                results = self.find_variable_usage_scope(target)
+                return {
+                    "query_type": "variable_scope",
+                    "target": target,
+                    "results": results,
+                    "summary": f"Variable '{target}' has {len(results['instances'])} instances across different scopes"
+                }
+            
+            else:
+                return {
+                    "error": f"Unknown query type: {query_type}",
+                    "supported_types": [
+                        "who_calls", "what_calls", "who_imports", "who_modifies",
+                        "class_hierarchy", "overrides", "dead_code", "call_chain",
+                        "module_deps", "variable_scope"
+                    ]
+                }
+        
+        except Exception as e:
+            return {
+                "error": f"Error executing relationship query: {str(e)}",
+                "query_type": query_type,
+                "target": target
+            }
+
     def close(self):
         """Close Neo4j driver"""
         self.driver.close()
@@ -881,6 +1630,33 @@ class MCPServer:
                     "type": "object",
                     "properties": {},
                     "additionalProperties": False
+                }
+            },
+            "analyze_code_relationships": {
+                "name": "analyze_code_relationships",
+                "description": "Analyze code relationships like 'who calls this function', 'what does this call', 'who imports this', etc.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query_type": {
+                            "type": "string",
+                            "description": "Type of relationship query",
+                            "enum": [
+                                "who_calls", "what_calls", "who_imports", "who_modifies",
+                                "class_hierarchy", "overrides", "dead_code"
+                            ]
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "The function, class, module, or variable name to analyze"
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Optional: specific file path for more precise results",
+                            "default": None
+                        }
+                    },
+                    "required": ["query_type", "target"]
                 }
             },
             "find_code": {
@@ -1144,6 +1920,37 @@ class MCPServer:
             debug_log(f"Error listing jobs: {str(e)}")
             return {"error": f"Failed to list jobs: {str(e)}"}
     
+    def analyze_code_relationships_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool to analyze code relationships"""
+        query_type = args.get('query_type', '')
+        target = args.get('target', '')
+        context = args.get('context')
+        
+        if not query_type or not target:
+            return {
+                "error": "Both 'query_type' and 'target' are required",
+                "supported_query_types": [
+                    "who_calls", "what_calls", "who_imports", "who_modifies",
+                    "class_hierarchy", "overrides", "dead_code"
+                ]
+            }
+        
+        try:
+            debug_log(f"Analyzing relationships: {query_type} for {target}")
+            results = self.code_finder.analyze_code_relationships(query_type, target, context)
+            
+            return {
+                "success": True,
+                "query_type": query_type,
+                "target": target,
+                "context": context,
+                "results": results
+            }
+        
+        except Exception as e:
+            debug_log(f"Error analyzing relationships: {str(e)}")
+            return {"error": f"Failed to analyze relationships: {str(e)}"}
+
     def find_code_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool to find relevant code snippets"""
         user_query = args.get('query', '')
@@ -1176,6 +1983,8 @@ class MCPServer:
             return self.list_jobs_tool(args)
         elif tool_name == "find_code":
             return self.find_code_tool(args)
+        elif tool_name == "analyze_code_relationships":
+            return self.analyze_code_relationships_tool(args)
         else:
             return {"error": f"Unknown tool: {tool_name}"}
     
