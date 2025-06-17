@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 NEO4J_URI = os.getenv('NEO4J_URI')
 NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
+JS_PARSER = str(Path(__file__).parent / "js_parser.js")
 
 def debug_log(message):
     """Write debug message to a file"""
@@ -608,6 +609,45 @@ class GraphBuilder:
                 'error': str(e)
             }
     
+    def parse_js_file(self, file_path: Path, is_dependency: bool = False) -> Dict:
+        """Parse a Python file and extract code elements"""
+        try:
+            result = subprocess.run(
+                ['node', JS_PARSER, file_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+            # Parse JSON result from stdout
+            analysis = json.loads(result.stdout)
+            return analysis
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error parsing {file_path}: {e.stderr}")
+            return {
+                'file_path': str(file_path),
+                'functions': [],
+                'classes': [],
+                'variables': [],
+                'imports': [],
+                'function_calls': [],
+                'is_dependency': is_dependency,
+                'error': str(e)
+            }
+        except Exception as e:
+            logger.error(f"Error parsing {file_path}: {e}")
+            return {
+                'file_path': str(file_path),
+                'functions': [],
+                'classes': [],
+                'variables': [],
+                'imports': [],
+                'function_calls': [],
+                'is_dependency': is_dependency,
+                'error': str(e)
+            }
+    
     def add_repository_to_graph(self, repo_path: Path, is_dependency: bool = False):
         """Add repository to Neo4j graph"""
         repo_name = repo_path.name
@@ -620,7 +660,7 @@ class GraphBuilder:
                     r.is_dependency = $is_dependency
             """, name=repo_name, path=str(repo_path), url=None, is_dependency=is_dependency)
     
-    def add_file_to_graph(self, file_data: Dict, repo_name: str):
+    def add_python_file_to_graph(self, file_data: Dict, repo_name: str):
         """Add file and its elements to Neo4j graph with proper relationships"""
         file_path = file_data['file_path']
         file_name = Path(file_path).name
@@ -723,21 +763,138 @@ class GraphBuilder:
             # Create CONTAINS relationships for class methods
             self._create_class_method_relationships(session, file_data)
     
+    def add_js_file_to_graph(self, file_data: Dict, repo_name: str):
+        """Add file and its elements to Neo4j graph with proper relationships"""
+        file_path = file_data['file_path']
+        file_name = Path(file_path).name
+        relative_path = str(Path(file_path).relative_to(Path(file_path).parent.parent))
+        is_dependency = file_data.get('is_dependency', False)
+        
+        with self.driver.session() as session:
+            # Create file node and CONTAINS relationship from Repository
+            session.run("""
+                MATCH (r:Repository {name: $repo_name})
+                MERGE (f:File {path: $path})
+                SET f.name = $name, 
+                    f.relative_path = $relative_path,
+                    f.is_dependency = $is_dependency
+                MERGE (r)-[:CONTAINS]->(f)
+            """, repo_name=repo_name, path=file_path, name=file_name, 
+                relative_path=relative_path, is_dependency=is_dependency)
+            
+            # Add functions with CONTAINS relationships
+            for func in file_data['functions']:
+                session.run("""
+                    MATCH (f:File {path: $file_path})
+                    MERGE (fn:Function {name: $name, file_path: $file_path, line_number: $line_number})
+                    SET fn.end_line = $end_line,
+                        fn.args = $args,
+                        fn.source = $source,
+                        fn.context = $context,
+                        fn.class_context = $class_context,
+                        fn.is_dependency = $is_dependency,
+                        fn.docstring = $docstring,
+                        fn.startColumn = $startColumn,
+                        fn.endColumn = $endColumn,
+                        fn.export = $is_Export
+                    MERGE (f)-[:CONTAINS]->(fn)
+                """, file_path=file_path, **func)
+            
+            # Add classes with CONTAINS relationships
+            for cls in file_data['classes']:
+                session.run("""
+                    MATCH (f:File {path: $file_path})
+                    MERGE (c:Class {name: $name, file_path: $file_path, line_number: $line_number})
+                    SET c.end_line = $end_line,
+                        c.bases = $bases,
+                        c.source = $source,
+                        c.context = $context,
+                        c.is_dependency = $is_dependency,
+                        c.startColumn = $startColumn,
+                        c.endColumn = $endColumn,
+                        c.export = $is_Export
+                    MERGE (f)-[:CONTAINS]->(c)
+                """, file_path=file_path, **cls)
+            
+            # Create INHERITS_FROM relationships for classes
+            for cls in file_data['classes']:
+                base_class = cls.get('bases', None)
+                if base_class :  # Filter out complex expressions
+                    session.run("""
+                        MATCH (child:Class {name: $child_name, file_path: $file_path})
+                        MATCH (parent:Class {name: $parent_name})
+                        MERGE (child)-[:INHERITS_FROM]->(parent)
+                    """, child_name=cls['name'], file_path=file_path, parent_name=base_class)
+            
+            # Add variables with CONTAINS relationships
+            for var in file_data['variables']:
+                session.run("""
+                    MATCH (f:File {path: $file_path})
+                    MERGE (v:Variable {name: $name, file_path: $file_path, line_number: $line_number})
+                    SET v.value = $value,
+                        v.context = $context,
+                        v.is_dependency = $is_dependency,
+                        v.class_context = $class_context,
+                        v.startColumn = $startColumn,
+                        v.endColumn = $endColumn
+                    MERGE (f)-[:CONTAINS]->(v)
+                """, file_path=file_path, **var)
+                
+                # Create CONTAINS relationships from functions/classes to variables
+                if var.get('context'):
+                    # Check if context is a function
+                    session.run("""
+                        MATCH (v:Variable {name: $var_name, file_path: $file_path, line_number: $var_line})
+                        MATCH (fn:Function {name: $context_name, file_path: $file_path , class_context : $class_context})
+                        MERGE (fn)-[:CONTAINS]->(v)
+                    """, var_name=var['name'], file_path=file_path, 
+                        var_line=var['line_number'], context_name=var['context'] , class_context=var["class_context"])
+                    
+                    # Check if context is a class
+                    session.run("""
+                        MATCH (v:Variable {name: $var_name, file_path: $file_path, line_number: $var_line})
+                        MATCH (c:Class {name: $context_name, file_path: $file_path})
+                        MERGE (c)-[:CONTAINS]->(v)
+                    """, var_name=var['name'], file_path=file_path,
+                        var_line=var['line_number'], context_name=var['context'])
+            
+            # Add modules and IMPORTS relationships
+            for imp in file_data['imports']:
+                session.run("""
+                    MATCH (f:File {path: $file_path})
+                    MERGE (m:Module {name: $name})
+                    SET m.alias = $alias,
+                    m.moduleSource = $moduleSource
+                    MERGE (f)-[:IMPORTS]->(m)
+                """, file_path=file_path, **imp)
+            
+            # Create CALLS relationships between functions
+            self._create_function_calls(session, file_data)
+            
+            # Create CONTAINS relationships for class methods
+            self._create_class_method_relationships(session, file_data)
+    
     def _create_function_calls(self, session, file_data: Dict):
         """Create CALLS relationships between functions based on function_calls data with improved matching"""
         file_path = file_data['file_path']
+        
         
         for call in file_data.get('function_calls', []):
             caller_context = call.get('context')
             called_name = call['name']
             full_call_name = call.get('full_name', called_name)
             line_number = call['line_number']
+            call_type = call.get("type" , None)
+            startColumn = None
+            
+            if file_path.endswith(".js"):
+                startColumn = call["startColumn"]
             
             # Skip built-in functions and common patterns
-            if called_name in ['print', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple']:
+            if file_path.endswith(".py") and called_name in ['print', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple']:
                 continue
                 
-            if caller_context:
+            if file_path.endswith(".py") and caller_context:
                 # Strategy 1: Try exact match with the called function name
                 session.run("""
                     MATCH (caller:Function {name: $caller_name, file_path: $file_path})
@@ -771,6 +928,23 @@ class GraphBuilder:
                         line_number=line_number,
                         args=call.get('args', []),
                         full_call_name=full_call_name)
+            
+            elif file_path.endswith(".js") and caller_context:
+                # Strategy 1: Try exact match with the called function name
+                session.run("""
+                    MATCH (caller:Function {name: $caller_name, file_path: $file_path})
+                    MATCH (called:Function {name: $called_name})
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, call_type: $call_type , startColumn : $startColumn}]->(called)
+                """, 
+                caller_name=caller_context,
+                file_path=file_path,
+                called_name=called_name,
+                line_number=line_number,
+                args=call.get('args', []),
+                full_call_name=full_call_name,
+                call_type = call_type,
+                startColumn = startColumn)
+                
     
     def _create_class_method_relationships(self, session, file_data: Dict):
         """Create CONTAINS relationships from classes to their methods"""
@@ -799,13 +973,19 @@ class GraphBuilder:
             # Add repository
             self.add_repository_to_graph(path, is_dependency)
             
-            # Find Python files
+            # Find files
+            python_files = []
+            js_files = []
+            
             if path.is_file() and path.suffix == '.py':
                 python_files = [path]
+            elif path.is_file() and path.suffix == '.js':
+                js_files = [path]
             else:
                 python_files = list(path.glob("**/*.py"))
+                js_files = list(path.glob("**/*.js"))
             
-            total_files = len(python_files)
+            total_files = len(python_files) + len(js_files)
             processed_files = 0
             errors = []
             
@@ -820,7 +1000,29 @@ class GraphBuilder:
                         job_manager.update_job(job_id, current_file=str(file_path))
                     
                     file_data = self.parse_python_file(file_path, is_dependency)
-                    self.add_file_to_graph(file_data, path.name)
+                    self.add_python_file_to_graph(file_data, path.name)
+                    processed_files += 1
+                    
+                    # Update progress
+                    if job_manager and job_id:
+                        job_manager.update_job(job_id, processed_files=processed_files)
+                    
+                    # Small delay to allow other operations
+                    await asyncio.sleep(0.001)
+                    
+                except Exception as e:
+                    error_msg = f"Error processing {file_path}: {e}"
+                    errors.append(error_msg)
+                    logger.error(error_msg)
+                    
+            for file_path in js_files:
+                try:
+                    # Update current file being processed
+                    if job_manager and job_id:
+                        job_manager.update_job(job_id, current_file=str(file_path))
+                    
+                    file_data = self.parse_js_file(file_path, is_dependency)
+                    self.add_js_file_to_graph(file_data, path.name)
                     processed_files += 1
                     
                     # Update progress
@@ -1970,6 +2172,7 @@ class MCPServer:
             return {"error": f"Failed to find code: {str(e)}"}
     
     async def handle_tool_call(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        
         """Handle tool calls"""
         if tool_name == "list_imports":
             return self.list_imports_tool(args)
