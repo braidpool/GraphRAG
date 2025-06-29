@@ -26,7 +26,10 @@ from urllib.request import urlopen
 from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from enum import Enum
-import requests
+import torch
+import numpy as np
+import torch
+import numpy as np
 
 from neo4j import GraphDatabase
 
@@ -38,6 +41,7 @@ logger = logging.getLogger(__name__)
 NEO4J_URI = os.getenv('NEO4J_URI')
 NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
+HF_TOKEN = os.getenv('HF_TOKEN')
 JS_PARSER = str(Path(__file__).parent / "js_parser.js")
 
 def debug_log(message):
@@ -681,6 +685,8 @@ class GraphBuilder:
             
             # Add functions with CONTAINS relationships
             for func in file_data['functions']:
+                code_text = func.get('source')  + f"\n{func["name"]} is defined in the {func["context"]} , {file_path}"
+                embedding = self._embed_text(code_text) if code_text else None
                 session.run("""
                     MATCH (f:File {path: $file_path})
                     MERGE (fn:Function {name: $name, file_path: $file_path, line_number: $line_number})
@@ -690,12 +696,15 @@ class GraphBuilder:
                         fn.context = $context,
                         fn.is_dependency = $is_dependency,
                         fn.docstring = $docstring,
-                        fn.decorators = $decorators
+                        fn.decorators = $decorators,
+                        fn.embedding = $embedding
                     MERGE (f)-[:CONTAINS]->(fn)
-                """, file_path=file_path, **func)
+                """, file_path=file_path, embedding=embedding, **func)
             
             # Add classes with CONTAINS relationships
             for cls in file_data['classes']:
+                code_text = cls.get('source') + f"\n{cls["name"]} is defined in the {cls["context"]} , {file_path}"
+                embedding = self._embed_text(code_text) if code_text else None
                 session.run("""
                     MATCH (f:File {path: $file_path})
                     MERGE (c:Class {name: $name, file_path: $file_path, line_number: $line_number})
@@ -705,9 +714,10 @@ class GraphBuilder:
                         c.context = $context,
                         c.is_dependency = $is_dependency,
                         c.docstring = $docstring,
-                        c.decorators = $decorators
+                        c.decorators = $decorators,
+                        c.embedding = $embedding
                     MERGE (f)-[:CONTAINS]->(c)
-                """, file_path=file_path, **cls)
+                """, file_path=file_path, embedding=embedding, **cls)
             
             # Create INHERITS_FROM relationships for classes
             for cls in file_data['classes']:
@@ -784,6 +794,8 @@ class GraphBuilder:
             
             # Add functions with CONTAINS relationships
             for func in file_data['functions']:
+                code_text = f"Function docstring :- {func.get('docstring')}\n" + func.get('source') + f"\n{func["name"]} is defined in the {func["context"]} , {func["file_path"]}"
+                embedding = self._embed_text(code_text) if code_text else None
                 session.run("""
                     MATCH (f:File {path: $file_path})
                     MERGE (fn:Function {name: $name, file_path: $file_path, line_number: $line_number})
@@ -796,12 +808,15 @@ class GraphBuilder:
                         fn.docstring = $docstring,
                         fn.startColumn = $startColumn,
                         fn.endColumn = $endColumn,
-                        fn.export = $is_Export
+                        fn.export = $is_Export,
+                        fn.embedding = $embedding
                     MERGE (f)-[:CONTAINS]->(fn)
-                """, file_path=file_path, **func)
+                """, file_path=file_path, embedding=embedding, **func)
             
             # Add classes with CONTAINS relationships
             for cls in file_data['classes']:
+                code_text = f"Class docstring :- {cls.get('docstring')}\n" + cls.get('source') + f"\n{cls["name"]} is defined in the {cls["context"]} , {cls["file_path"]}"
+                embedding = self._embed_text(code_text) if code_text else None
                 session.run("""
                     MATCH (f:File {path: $file_path})
                     MERGE (c:Class {name: $name, file_path: $file_path, line_number: $line_number})
@@ -812,9 +827,10 @@ class GraphBuilder:
                         c.is_dependency = $is_dependency,
                         c.startColumn = $startColumn,
                         c.endColumn = $endColumn,
-                        c.export = $is_Export
+                        c.export = $is_Export,
+                        c.embedding = $embedding
                     MERGE (f)-[:CONTAINS]->(c)
-                """, file_path=file_path, **cls)
+                """, file_path=file_path, embedding=embedding, **cls)
             
             # Create INHERITS_FROM relationships for classes
             for cls in file_data['classes']:
@@ -945,7 +961,6 @@ class GraphBuilder:
                 call_type = call_type,
                 startColumn = startColumn)
                 
-    
     def _create_class_method_relationships(self, session, file_data: Dict):
         """Create CONTAINS relationships from classes to their methods"""
         file_path = file_data['file_path']
@@ -1682,6 +1697,159 @@ class CodeFinder:
         """Close Neo4j driver"""
         self.driver.close()
 
+class SemanticCodeSearcher:
+    """Class to handle semantic code search"""
+
+    # Edge weights for propagation (do not include CONTAINS)
+    EDGE_WEIGHTS = {
+        "CALLS": 0.4
+        # Add more edge types as needed
+    }
+
+    def __init__(self, embedding_model, embedding_tokenizer, code_finder):
+        self.embedding_model = embedding_model
+        self.embedding_tokenizer = embedding_tokenizer
+        self.code_finder = code_finder
+
+    def embed_text(self, text: str):
+        inputs = self.embedding_tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length = 8192)
+        with torch.no_grad():
+            outputs = self.embedding_model(**inputs)
+            if hasattr(outputs, 'last_hidden_state'):
+                emb = outputs.last_hidden_state[:, 0, :].cpu().numpy().flatten()
+            else:
+                emb = outputs[0][:, 0, :].cpu().numpy().flatten()
+        return emb
+
+    def cosine_similarity(self, a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    def semantic_search_with_propagation(
+        self, 
+        query: str, 
+        repo: Optional[str] = None, 
+        file_names: Optional[List[str]] = None, 
+        class_contexts: Optional[List[str]] = None, 
+        function_names: Optional[List[str]] = None, 
+        top_k: int = 10
+    ):
+        """
+        Perform semantic similarity search and propagate scores through the graph.
+        Args:
+            query (str): The natural language search query.
+            repo (str): The repository to search in.
+            file_names (list, optional): Filter by file names. Defaults to None.
+            class_contexts (list, optional): Filter by class contexts. Defaults to None.
+            function_names (list, optional): Filter by function names. Defaults to None.
+            top_k (int, optional): The total number of results to return. Defaults to 10.
+            
+        Returns:
+            list: A list of top-k matching nodes with their details.
+        """
+        if not self.code_finder.driver:
+            raise ConnectionError("Neo4j driver not initialized.")
+
+        query_embedding = self.embed_text(query)
+
+        cypher_query = """
+        MATCH (n)
+        WHERE (n:Function OR n:Class OR n:Variable)
+          AND n.embedding IS NOT NULL
+        """
+        params = {}
+
+        if file_names:
+            cypher_query += " AND n.file_path IN $file_names"
+            params["file_names"] = file_names
+        if class_contexts:
+            cypher_query += " AND n.class_name IN $class_contexts"
+            params["class_contexts"] = class_contexts
+        if function_names:
+            cypher_query += " AND n.function_name IN $function_names"
+            params["function_names"] = function_names
+            
+        cypher_query += " RETURN n, n.embedding AS embedding, elementId(n) AS node_id"
+
+        with self.code_finder.driver.session() as session:
+            result = session.run(cypher_query, params)
+            
+            nodes_with_embeddings = []
+            for record in result:
+                node_data = dict(record["n"])
+                embedding = record["embedding"]
+                node_id = record["node_id"]
+                
+                node_data["node_id"] = node_id
+                if embedding:
+                    nodes_with_embeddings.append((node_data, np.array(embedding)))
+
+        if not nodes_with_embeddings:
+            return []
+
+        # Calculate initial similarity scores
+        scored_nodes = {}
+        for node_data, embedding in nodes_with_embeddings:
+            node_id = node_data['node_id']
+            similarity = self.cosine_similarity(query_embedding, embedding)
+            scored_nodes[node_id] = {
+                "score": similarity,
+                "node": node_data
+            }
+            
+        # Sort by initial score to get seed nodes
+        seed_nodes = sorted(scored_nodes.values(), key=lambda x: x['score'], reverse=True)
+
+        # Score propagation with edge weights (excluding CONTAINS)
+        propagated_scores = scored_nodes.copy()
+        with self.code_finder.driver.session() as session:
+            for seed in seed_nodes:
+                seed_id = seed['node']['node_id']
+                seed_score = seed['score']
+                # Query all outgoing and incoming relationships except CONTAINS
+                rel_query = """
+                    MATCH (n)-[r]->(m)
+                    WHERE elementId(n) = $id AND type(r) <> 'CONTAINS'
+                    RETURN type(r) AS rel_type, elementId(m) AS neighbor_id
+                    UNION
+                    MATCH (m)-[r]->(n)
+                    WHERE elementId(n) = $id AND type(r) <> 'CONTAINS'
+                    RETURN type(r) AS rel_type, elementId(m) AS neighbor_id
+                """
+                rel_result = session.run(rel_query, id=seed_id)
+                for record in rel_result:
+                    rel_type = record['rel_type']
+                    neighbor_id = record['neighbor_id']
+                    weight = self.EDGE_WEIGHTS.get(rel_type, 0.5)  # Default weight if not specified
+                    if neighbor_id in propagated_scores:
+                        propagated_scores[neighbor_id]['score'] += seed_score * weight
+
+        # Rank all nodes by final score
+        final_ranked_nodes = sorted(propagated_scores.values(), key=lambda x: x['score'], reverse=True)
+        to_send = []
+        included_classes = set()  # Set of (class_name, file_path)
+        class_count = 0
+        for entry in final_ranked_nodes:
+            node = entry["node"]
+            # Identify class node by presence of 'bases' property
+            is_class = "bases" in node
+            if is_class:
+                class_key = (node.get("name"), node.get("file_path"))
+                if class_count <= 2:
+                    to_send.append({k: v for k, v in node.items() if k not in ("embedding", "node_id", "args", "end_line")})
+                    included_classes.add(class_key)
+                    class_count += 1
+                # else: skip this class node
+            else:
+                # For non-class nodes, check if they are a child of an included class
+                class_context = node.get("class_context")
+                file_path = node.get("file_path")
+                if class_context and (class_context, file_path) in included_classes:
+                    continue  # Skip children of included classes
+                to_send.append({k: v for k, v in node.items() if k not in ("embedding", "node_id", "args", "end_line")})
+            if len(to_send) >= top_k:
+                break
+        return to_send
+
 class MCPServer:
     """Main MCP Server class with all tools"""
     
@@ -1871,6 +2039,21 @@ class MCPServer:
                             "type": "string",
                             "description": "A keyword (or phrase), which can be a function name, class name, or content present in the source code"
                         }
+                    },
+                    "required": ["query"]
+                }
+            },
+            "code_search": {
+                "name": "code_search",
+                "description": "Retrieve the most relevant function and class definitions from the codebase based on a natural language or code-like query.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query (natural language or code)"},
+                        "file_names": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of file names to filter"},
+                        "class_contexts": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of class contexts to filter"},
+                        "function_names": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of function names to filter"},
+                        "top_k": {"type": "integer", "description": "Number of results to return", "default": 10}
                     },
                     "required": ["query"]
                 }
@@ -2154,26 +2337,40 @@ class MCPServer:
             return {"error": f"Failed to analyze relationships: {str(e)}"}
 
     def find_code_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool to find relevant code snippets"""
-        user_query = args.get('query', '')
+        """Tool to find code by name or content"""
+        query = args.get('query')
+        if not query:
+            return {"error": "Query parameter is required"}
         
+        results = self.code_finder.find_related_code(query)
+        return {"success": True, "results": results}
+
+    def semantic_code_search_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool for semantic code search with propagation"""
         try:
-            debug_log(f"Finding code for query: {user_query}")
-            results = self.code_finder.find_related_code(user_query)
-            
-            return {
-                "success": True,
-                "query": user_query,
-                "results": results
-            }
-        
+            query = args['query']
+            repo = args.get('repo')
+            file_names = args.get('file_names')
+            class_contexts = args.get('class_contexts')
+            function_names = args.get('function_names')
+
+            top_k = args.get('top_k', 10)
+
+            results = self.semantic_searcher.semantic_search_with_propagation(
+                query=query,
+                repo=repo,
+                file_names=file_names,
+                class_contexts=class_contexts,
+                function_names=function_names,
+                top_k=top_k
+            )
+            return {"success": True, "results": results}
         except Exception as e:
-            debug_log(f"Error finding code: {str(e)}")
-            return {"error": f"Failed to find code: {str(e)}"}
-    
+            logger.error(f"Error during semantic search: {e}")
+            return {"error": f"Failed to perform semantic search: {str(e)}"}
+
     async def handle_tool_call(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        
-        """Handle tool calls"""
+        """Handle incoming tool calls"""
         if tool_name == "list_imports":
             return self.list_imports_tool(args)
         elif tool_name == "add_code_to_graph":
@@ -2188,6 +2385,8 @@ class MCPServer:
             return self.find_code_tool(args)
         elif tool_name == "analyze_code_relationships":
             return self.analyze_code_relationships_tool(args)
+        elif tool_name == "code_search":
+            return self.semantic_code_search_tool(args)
         else:
             return {"error": f"Unknown tool: {tool_name}"}
     
