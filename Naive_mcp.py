@@ -28,9 +28,6 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import torch
 import numpy as np
-import torch
-import numpy as np
-
 from neo4j import GraphDatabase
 
 # Configure logging
@@ -41,7 +38,7 @@ logger = logging.getLogger(__name__)
 NEO4J_URI = os.getenv('NEO4J_URI')
 NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
-HF_TOKEN = os.getenv('HF_TOKEN')
+HF_TOKEN = os.getenv("HF_TOKEN")
 JS_PARSER = str(Path(__file__).parent / "js_parser.js")
 
 def debug_log(message):
@@ -514,7 +511,7 @@ class CodeVisitor(ast.NodeVisitor):
 class GraphBuilder:
     """Module for building and managing Neo4j graphs with proper relationships"""
     
-    def __init__(self, neo4j_uri: str = None, neo4j_user: str = None, neo4j_password: str = None):
+    def __init__(self, neo4j_uri: str = None, neo4j_user: str = None, neo4j_password: str = None, embedding_model = None, embedding_tokenizer = None):
         # Validate credentials
         self.neo4j_uri = neo4j_uri or NEO4J_URI
         self.neo4j_user = neo4j_user or NEO4J_USER
@@ -525,6 +522,23 @@ class GraphBuilder:
         
         self.driver = GraphDatabase.driver(self.neo4j_uri, auth=(self.neo4j_user, self.neo4j_password))
         self.create_schema()
+        
+        # For embedding
+        self.embedding_tokenizer = embedding_tokenizer
+        self.embedding_model = embedding_model
+
+    def _embed_text(self, text: str):
+        if self.embedding_model is None or self.embedding_tokenizer is None:
+            return None
+        
+        inputs = self.embedding_tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+        with torch.no_grad():
+            outputs = self.embedding_model(**inputs)
+            if hasattr(outputs, 'last_hidden_state'):
+                emb = outputs.last_hidden_state[:, 0, :].cpu().numpy().flatten()
+            else:
+                emb = outputs[0][:, 0, :].cpu().numpy().flatten()
+        return emb.tolist()
     
     def create_schema(self):
         """Create constraints and indexes in Neo4j"""
@@ -1702,7 +1716,7 @@ class SemanticCodeSearcher:
 
     # Edge weights for propagation (do not include CONTAINS)
     EDGE_WEIGHTS = {
-        "CALLS": 0.4
+        "CALLS": 0.2
         # Add more edge types as needed
     }
 
@@ -1712,7 +1726,7 @@ class SemanticCodeSearcher:
         self.code_finder = code_finder
 
     def embed_text(self, text: str):
-        inputs = self.embedding_tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length = 8192)
+        inputs = self.embedding_tokenizer(text, return_tensors="pt", truncation=True, max_length=8192)
         with torch.no_grad():
             outputs = self.embedding_model(**inputs)
             if hasattr(outputs, 'last_hidden_state'):
@@ -1825,30 +1839,10 @@ class SemanticCodeSearcher:
 
         # Rank all nodes by final score
         final_ranked_nodes = sorted(propagated_scores.values(), key=lambda x: x['score'], reverse=True)
-        to_send = []
-        included_classes = set()  # Set of (class_name, file_path)
-        class_count = 0
-        for entry in final_ranked_nodes:
-            node = entry["node"]
-            # Identify class node by presence of 'bases' property
-            is_class = "bases" in node
-            if is_class:
-                class_key = (node.get("name"), node.get("file_path"))
-                if class_count <= 2:
-                    to_send.append({k: v for k, v in node.items() if k not in ("embedding", "node_id", "args", "end_line")})
-                    included_classes.add(class_key)
-                    class_count += 1
-                # else: skip this class node
-            else:
-                # For non-class nodes, check if they are a child of an included class
-                class_context = node.get("class_context")
-                file_path = node.get("file_path")
-                if class_context and (class_context, file_path) in included_classes:
-                    continue  # Skip children of included classes
-                to_send.append({k: v for k, v in node.items() if k not in ("embedding", "node_id", "args", "end_line")})
-            if len(to_send) >= top_k:
-                break
-        return to_send
+        for entry in final_ranked_nodes[:top_k]:
+            entry["node"].pop("embedding", None)
+        
+        return final_ranked_nodes[:top_k]
 
 class MCPServer:
     """Main MCP Server class with all tools"""
@@ -1863,12 +1857,29 @@ class MCPServer:
                 "- NEO4J_PASSWORD\n"
                 "Please configure these in your MCP settings."
             )
+            
+        # Embedding model setup
+        self._load_embedding_model()
         
-        self.graph_builder = GraphBuilder()
+        self.graph_builder = GraphBuilder(embedding_model=self.embedding_model , embedding_tokenizer=self.embedding_tokenizer)
         self.code_finder = CodeFinder()
         self.import_extractor = ImportExtractor()
         self.job_manager = JobManager()
+        self.semantic_searcher = SemanticCodeSearcher(
+            self.embedding_model, self.embedding_tokenizer, self.code_finder
+        )
     
+    def _load_embedding_model(self):
+        """Load the code embedding model (StarEncoder or fallback)"""
+        try:
+            from transformers import AutoTokenizer, AutoModel
+            self.embedding_model_name = "Salesforce/SFR-Embedding-Code-400M_R"
+            hf_token = HF_TOKEN
+            self.embedding_tokenizer = AutoTokenizer.from_pretrained(self.embedding_model_name, token=hf_token, trust_remote_code=True)
+            self.embedding_model = AutoModel.from_pretrained(self.embedding_model_name, token=hf_token, trust_remote_code=True)
+        except ImportError:
+            raise ImportError("transformers library is required for semantic search. Please install it via pip.")
+
     def get_local_package_path(self, package_name: str) -> Optional[str]:
         """Get the local installation path of a Python package"""
         try:
@@ -2045,12 +2056,12 @@ class MCPServer:
             },
             "code_search": {
                 "name": "code_search",
-                "description": "Retrieve the most relevant function and class definitions from the codebase based on a natural language or code-like query.",
+                "description": "Efficiently finds code snippets related to the given query from the codebase. Ideal for natural language queries, fuzzy intent discovery, or finding code behavior across functions, classes, or variables. Eg query `How graph is generated for the python codebase`",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "The search query (natural language or code)"},
-                        "file_names": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of file names to filter"},
+                        "file_paths": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of file path to filter"},
                         "class_contexts": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of class contexts to filter"},
                         "function_names": {"type": "array", "items": {"type": "string"}, "description": "Optional: list of function names to filter"},
                         "top_k": {"type": "integer", "description": "Number of results to return", "default": 10}
@@ -2350,7 +2361,7 @@ class MCPServer:
         try:
             query = args['query']
             repo = args.get('repo')
-            file_names = args.get('file_names')
+            file_names = args.get('file_paths')
             class_contexts = args.get('class_contexts')
             function_names = args.get('function_names')
 
