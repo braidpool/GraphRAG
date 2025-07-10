@@ -699,7 +699,7 @@ class GraphBuilder:
             
             # Add functions with CONTAINS relationships
             for func in file_data['functions']:
-                code_text = func.get('source')  + f"\n{func["name"]} is defined in the {func["context"]} , {file_path}"
+                code_text = func.get('source')  + f"\n{func['name']} is defined in the {func['context']} , {file_path}"
                 embedding = self._embed_text(code_text) if code_text else None
                 session.run("""
                     MATCH (f:File {path: $file_path})
@@ -717,7 +717,7 @@ class GraphBuilder:
             
             # Add classes with CONTAINS relationships
             for cls in file_data['classes']:
-                code_text = cls.get('source') + f"\n{cls["name"]} is defined in the {cls["context"]} , {file_path}"
+                code_text = cls.get('source') + f"\n{cls['name']} is defined in the {cls['context']} , {file_path}"
                 embedding = self._embed_text(code_text) if code_text else None
                 session.run("""
                     MATCH (f:File {path: $file_path})
@@ -808,7 +808,7 @@ class GraphBuilder:
             
             # Add functions with CONTAINS relationships
             for func in file_data['functions']:
-                code_text = f"Function docstring :- {func.get('docstring')}\n" + func.get('source') + f"\n{func["name"]} is defined in the {func["context"]} , {func["file_path"]}"
+                code_text = f"Function docstring :- {func.get('docstring')}\n" + func.get('source') + f"\n{func['name']} is defined in the {func['context']} , {func['file_path']}"
                 embedding = self._embed_text(code_text) if code_text else None
                 session.run("""
                     MATCH (f:File {path: $file_path})
@@ -1711,6 +1711,92 @@ class CodeFinder:
         """Close Neo4j driver"""
         self.driver.close()
 
+    def list_code_elements(self, element_type=None, file_path=None, class_name=None, limit=50):
+        """List functions, classes, and/or methods with flexible filters."""
+        with self.driver.session() as session:
+            queries = []
+            params = {"limit": limit}
+            results = []
+            # Normalize element_type
+            if element_type is None:
+                element_type = ["function", "class", "method"]
+            elif isinstance(element_type, str):
+                element_type = [element_type]
+            element_type = set([e.lower() for e in element_type])
+
+            # Normalize file_path to file_paths (list or None)
+            file_paths = None
+            if file_path:
+                if isinstance(file_path, str):
+                    file_paths = [file_path]
+                elif isinstance(file_path, list):
+                    file_paths = file_path
+                else:
+                    raise ValueError("file_path must be a string or list of strings")
+
+            # List classes
+            if "class" in element_type:
+                q = """
+                    MATCH (c:Class)
+                    {file_filter}
+                    RETURN 'class' as type, c.name as name, c.file_path as file_path, c.line_number as line_number, c.docstring as docstring, null as args
+                    ORDER BY c.file_path, c.line_number
+                    LIMIT $limit
+                """
+                file_filter = ""
+                if file_paths:
+                    file_filter = "WHERE c.file_path IN $file_paths"
+                    params["file_paths"] = file_paths
+                queries.append((q.format(file_filter=file_filter), dict(params)))
+
+            # List functions (top-level only)
+            if "function" in element_type:
+                q = """
+                    MATCH (f:Function)
+                    WHERE NOT ( (:Class)-[:CONTAINS]->(f) )
+                    {file_filter}
+                    RETURN 'function' as type, f.name as name, f.file_path as file_path, f.line_number as line_number, f.docstring as docstring, f.args as args
+                    ORDER BY f.file_path, f.line_number
+                    LIMIT $limit
+                """
+                file_filter = ""
+                if file_paths:
+                    file_filter = "AND f.file_path IN $file_paths"
+                    params["file_paths"] = file_paths
+                queries.append((q.format(file_filter=file_filter), dict(params)))
+
+            # List methods (functions contained in a class)
+            if "method" in element_type:
+                q = """
+                    MATCH (c:Class)-[:CONTAINS]->(m:Function)
+                    {class_filter}
+                    {file_filter}
+                    RETURN 'method' as type, m.name as name, m.file_path as file_path, m.line_number as line_number, m.docstring as docstring, m.args as args, c.name as class_name
+                    ORDER BY m.file_path, m.line_number
+                    LIMIT $limit
+                """
+                class_filter = ""
+                file_filter = ""
+                if class_name:
+                    class_filter = "WHERE c.name = $class_name"
+                    params["class_name"] = class_name
+                if file_paths:
+                    if class_filter:
+                        file_filter = "AND m.file_path IN $file_paths"
+                    else:
+                        file_filter = "WHERE m.file_path IN $file_paths"
+                    params["file_paths"] = file_paths
+                queries.append((q.format(class_filter=class_filter, file_filter=file_filter), dict(params)))
+
+            for q, p in queries:
+                for record in session.run(q, **p):
+                    d = dict(record)
+                    # Truncate docstring for brevity
+                    if d.get("docstring"):
+                        d["docstring"] = d["docstring"][:200] + ("..." if len(d["docstring"]) > 200 else "")
+                    results.append(d)
+            return results[:limit]
+
 class SemanticCodeSearcher:
     """Class to handle semantic code search"""
 
@@ -2068,6 +2154,21 @@ class MCPServer:
                     },
                     "required": ["query"]
                 }
+            },
+            "list_code_elements": {
+                "name": "list_code_elements",
+                "description": "List all functions, methods, and classes in the codebase, with flexible filters (by file, class, type, etc.). Accepts a file path or a list of file paths. Returns name, args, docstring, file, line, and type.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "element_type": {"type": "array", "items": {"type": "string"},  "description": "Type(s) to list: 'function', 'class', 'method', or a list of these."},
+                        "file_path": {"type": "array", "items": {"type": "string"}, "description": "Filter to a list of file paths."
+                             },
+                        "class_name": {"type": "string", "items": {"type": "string"}, "description": "Optional: filter to a specific class (for methods)."},
+                        "limit": {"type": "integer", "description": "Max results to return.", "default": 50}
+                    },
+                    "required": []
+                }
             }
         }
     
@@ -2380,6 +2481,18 @@ class MCPServer:
             logger.error(f"Error during semantic search: {e}")
             return {"error": f"Failed to perform semantic search: {str(e)}"}
 
+    def list_code_elements_tool(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool to list code elements (functions, classes, methods) with flexible filters."""
+        element_type = args.get("element_type")
+        file_path = args.get("file_path")
+        class_name = args.get("class_name")
+        limit = args.get("limit", 50)
+        try:
+            results = self.code_finder.list_code_elements(element_type, file_path, class_name, limit)
+            return {"success": True, "results": results, "count": len(results)}
+        except Exception as e:
+            return {"error": f"Failed to list code elements: {str(e)}"}
+
     async def handle_tool_call(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Handle incoming tool calls"""
         if tool_name == "list_imports":
@@ -2398,6 +2511,8 @@ class MCPServer:
             return self.analyze_code_relationships_tool(args)
         elif tool_name == "code_search":
             return self.semantic_code_search_tool(args)
+        elif tool_name == "list_code_elements":
+            return self.list_code_elements_tool(args)
         else:
             return {"error": f"Unknown tool: {tool_name}"}
     
