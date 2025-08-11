@@ -1,7 +1,7 @@
 import os
 import argparse
 import logging
-from flow import coding_agent_flow
+from flow import create_main_flow
 
 # Set up logging
 logging.basicConfig(
@@ -33,7 +33,6 @@ def main():
     if not user_query:
         user_query = input("What would you like me to help you with? ")
     
-    # Initialize shared memory
     shared = {
         "user_query": user_query,
         "working_dir": args.working_dir,
@@ -41,11 +40,21 @@ def main():
         "graphrag" : args.graphrag,
         "response": None
     }
+    coding_agent_flow = create_main_flow(args.graphrag)
+    while user_query:
     
-    logger.info(f"Working directory: {args.working_dir}")
-    
-    # Run the flow
-    coding_agent_flow.run(shared)
+        # Initialize shared memory
+        shared["user_query"] = user_query
+        
+        logger.info(f"Working directory: {args.working_dir}")
+        
+        # Run the flow
+        coding_agent_flow.run(shared)
+        
+        user_query = None
+        if not user_query:
+            user_query = input("What would you like me to help you with? ")
+        
 
 if __name__ == "__main__":
     main()
