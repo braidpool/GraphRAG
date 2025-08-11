@@ -1,13 +1,16 @@
 import os
 import re
-from typing import List, Dict, Any, Tuple, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+from .code_finder import CodeFinder
 
 def grep_search(
     query: str,
     case_sensitive: bool = True,
     include_pattern: Optional[str] = None,
     exclude_pattern: Optional[str] = None,
-    working_dir: str = ""
+    working_dir: str = "",
+    graph_rag : bool = True,
+    driver = None
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Search through files for specific patterns using regex.
@@ -30,18 +33,24 @@ def grep_search(
     """
     results = []
     search_dir = working_dir if working_dir else "."
-    
     try:
-        # Compile the regex pattern
-        try:
-            pattern = re.compile(query, 0 if case_sensitive else re.IGNORECASE)
-        except re.error as e:
-            print(f"Invalid regex pattern: {str(e)}")
-            return [], False
-        
-        # Convert glob patterns to regex for file matching
+        pattern = re.compile(query, 0 if case_sensitive else re.IGNORECASE)
         include_regexes = _glob_to_regex(include_pattern) if include_pattern else None
         exclude_regexes = _glob_to_regex(exclude_pattern) if exclude_pattern else None
+    except re.error as e:
+        print(f"Invalid regex pattern: {str(e)}")
+        return [], False
+    
+    if graph_rag :
+        codefinder = CodeFinder(driver)
+        try:
+            results = codefinder.find_related_code(query, case_sensitive, include_pattern , exclude_pattern)
+        
+        except Exception as e:
+            print(f"Search error: {str(e)}")
+            return [], False
+
+    try:
         
         # Walk through the directory and search files
         for root, _, files in os.walk(search_dir):
@@ -78,12 +87,17 @@ def grep_search(
             
             if len(results) >= 50:
                 break
+            
+        print("######################")
+        print(results)
+        print("######################")
         
         return results, True
     
     except Exception as e:
         print(f"Search error: {str(e)}")
         return [], False
+      
 
 def _glob_to_regex(pattern_str: str) -> List[re.Pattern]:
     """Convert comma-separated glob patterns to regex patterns."""
