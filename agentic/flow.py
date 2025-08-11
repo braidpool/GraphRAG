@@ -34,8 +34,7 @@ logger = logging.getLogger('coding_agent')
 #############################################
 # NEO4J Setup
 #############################################
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
+driver = None
 def create_schema():
     """Create constraints and indexes in Neo4j"""
     with driver.session() as session:
@@ -63,7 +62,7 @@ def create_schema():
             
         except Exception as e:
             logger.warning(f"Schema creation warning: {e}")
-create_schema()    
+   
 
 def format_history_summary(history: List[Dict[str, Any]]) -> str:
     if not history:
@@ -150,23 +149,29 @@ class MainDecisionAgent(Node):
         user_query = shared.get("user_query", "")
         history = shared.get("history", [])
         
-        return user_query, history
+        return user_query, history, shared.get("graphgrag", True)
     
-    def exec(self, inputs: Tuple[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-        user_query, history = inputs
+    def exec(self, inputs: Tuple[str, List[Dict[str, Any]], bool]) -> Dict[str, Any]:
+        user_query, history, graph_rag = inputs
         logger.info(f"MainDecisionAgent: Analyzing user query: {user_query}")
 
         # Format history using the utility function with 'basic' detail level
         history_str = format_history_summary(history)
         
         # Create prompt for the LLM using YAML instead of JSON
-        prompt = f"""You are a coding assistant that helps modify and navigate code. Given the following request, 
+        prompt = [f"""You are a coding assistant that helps modify and navigate code. Given the following request, 
 decide which tool to use from the available options.
 
 User request: {user_query}
 
 Here are the actions you performed:
 {history_str}
+
+IMPORTANT NOTE:
+- If the user's request involves writing or editing code, you MUST prioritize reusing existing functionality.
+  - Before writing any new code, first use grep_search or list_code_elements to find relevant utilities in the repository.
+  - When using edit_file, your primary goal is to integrate existing functions.
+  - Only write new logic when you are certain no reusable alternative exists.
 
 Available tools:
 1. read_file: Read content from a file
@@ -207,8 +212,8 @@ Available tools:
      params:
        target_file: temp.txt
 
-4. grep_search: Search for patterns in files
-   - Parameters: query, case_sensitive (optional), include_pattern (optional), exclude_pattern (optional)
+4. grep_search:  Search for patterns in files.
+   - Parameters: query , case_sensitive (optional), include_pattern (optional), exclude_pattern (optional)
    - Example:
      tool: grep_search
      reason: I need to find all occurrences of 'logger' in Python files
@@ -225,6 +230,10 @@ Available tools:
      params:
        relative_workspace_path: utils
    - Result: Returns a tree visualization of the directory structure
+"""]
+        
+        if graph_rag:
+            prompt.append("""
 
 6. list_code_elements: List functions, classes, and methods with flexible filters
     - Parameters: element_type (optional, 'function', 'class', 'method'), include_pattern (optional), exclude_pattern (optional), class_name (optional), limit (optional)
@@ -253,9 +262,43 @@ params:
   # parameters specific to the chosen tool
 ```
 
+IMPORTANT NOTE :
+- In the grep_search tool query will the regex pattern you want to search on.
+- After finish tool we have a seperate agent , which will format the answer correclty on the basis of past history
+- reason should be valid, concise and parsable by yaml
+- STRICTLY FOLLOW THE OUTPUT FORMAT
+
 If you believe no more actions are needed, use "finish" as the tool and explain why in the reason.
 """
+)
+        else :
+            prompt.append("""
+                          
+6. finish: End the process and provide final response
+   - No parameters required
+   - Example:
+     tool: finish
+     reason: I have completed the requested task of finding all logger instances
+     params: {{}}
+
+Respond with a YAML object containing:
+```yaml
+tool: one of: read_file, edit_file, delete_file, grep_search, list_dir, list_code_elements, finish
+reason: |
+  detailed explanation of why you chose this tool and what you intend to do
+  if you chose finish, explain why no more actions are needed
+params:
+  # parameters specific to the chosen tool
+```
+IMPORTANT NOTES :
+- After finish tool we have a seperate agent , which will format the answer correclty on the basis of past history
+- reason should be valid, concise and parsable by yaml
+- STRICTLY FOLLOW THE OUTPUT FORMAT
+
+If you believe no more actions are needed, use "finish" as the tool and explain why in the reason.
+                          """)        
         
+        prompt = "\n".join(prompt)
         # Call LLM to decide action
         response = call_llm(prompt)
 
@@ -384,6 +427,7 @@ class GrepSearchAction(Node):
             "case_sensitive": params.get("case_sensitive", False),
             "include_pattern": params.get("include_pattern"),
             "exclude_pattern": params.get("exclude_pattern"),
+            "graphrag" : shared.get("graphrag" , True),
             "working_dir": working_dir
         }
     
@@ -397,7 +441,9 @@ class GrepSearchAction(Node):
             case_sensitive=params.get("case_sensitive", False),
             include_pattern=params.get("include_pattern"),
             exclude_pattern=params.get("exclude_pattern"),
-            working_dir=working_dir
+            graph_rag=params.get("graphrag"),
+            working_dir=working_dir,
+            driver = driver
         )
     
     def post(self, shared: Dict[str, Any], prep_res: Dict[str, Any], exec_res: Tuple[bool, List[Dict[str, Any]]]) -> str:
@@ -854,7 +900,12 @@ def create_edit_agent() -> Flow:
 #############################################
 # Main Flow
 #############################################
-def create_main_flow() -> Flow:
+def create_main_flow(graphrag : bool = True) -> Flow:
+    global driver
+    
+    if graphrag:
+        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        create_schema() 
     # Create nodes
     main_agent = MainDecisionAgent()
     read_action = ReadFileAction()
@@ -883,6 +934,3 @@ def create_main_flow() -> Flow:
     
     # Create flow
     return Flow(start=main_agent)
-
-# Create the main flow
-coding_agent_flow = create_main_flow()
