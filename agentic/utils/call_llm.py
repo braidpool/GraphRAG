@@ -56,6 +56,7 @@ def call_llm(prompt: str, use_cache: bool = True) -> str:
         response = requests.post(api_url, json=payload, timeout=120)
         response.raise_for_status()  
         result = response.json()
+        print(result)
         response_text = result['candidates'][0]['content']['parts'][0]['text']
 
     except requests.exceptions.RequestException as e:
