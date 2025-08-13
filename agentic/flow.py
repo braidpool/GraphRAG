@@ -13,6 +13,7 @@ from utils.delete_file import delete_file
 from utils.replace_file import replace_file
 from utils.search_ops import grep_search, list_code_elements
 from utils.dir_ops import list_dir
+from utils.sementic_search import SemanticCodeSearcher
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
@@ -32,7 +33,7 @@ logger = logging.getLogger('coding_agent')
 
 
 #############################################
-# NEO4J Setup
+# UTILITY FUNCTION
 #############################################
 driver = None
 def create_schema():
@@ -62,8 +63,25 @@ def create_schema():
             
         except Exception as e:
             logger.warning(f"Schema creation warning: {e}")
-   
 
+sementic_seacher = None 
+def _initialize_semantic_searcher(driver, model_name : str = "Salesforce/SFR-Embedding-Code-400M_R" ):
+    """Initialize semantic searcher with embedding model if available"""
+    try:
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_name,trust_remote_code=True)
+        model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        
+        semantic_searcher = SemanticCodeSearcher(model, tokenizer, driver)
+        logger.info("Semantic searcher initialized successfully")
+        return semantic_searcher
+            
+    except Exception as e:
+        logger.error(f"Failed to initialize semantic searcher: {e}")
+        return None
+  
 def format_history_summary(history: List[Dict[str, Any]]) -> str:
     if not history:
         return "No previous actions."
@@ -130,6 +148,16 @@ def format_history_summary(history: List[Dict[str, Any]]) -> str:
                     else:
                         history_str += "  (Empty or inaccessible directory)\n"
                         logger.debug(f"Tree visualization missing or invalid: {tree_visualization}")
+                elif action['tool'] == 'code_search' and success:
+                    results = result.get("results", [])
+                    history_str += f"- Semantic search results: {len(results)}\n"
+                    # Show all results with scores
+                    history_str += str(results)
+                elif action['tool'] == 'list_code_elements' and success:
+                    matches = result.get("matches", [])
+                    history_str += f"- Code elements found: {len(matches)}\n"
+                    # Show all matches
+                    history_str += str(matches)
                 else:
                     history_str += f"- Result: {result}\n"
             else:
@@ -245,7 +273,18 @@ Available tools:
         include_pattern: ".*_test\\.py"
         limit: 20
 
-7. finish: End the process and provide final response
+7. code_search: Perform semantic search to find code snippets related to a natural language or code-based query.
+   - Parameters: query (string), include_pattern (optional), class_contexts (optional, list of regex pattern)
+   - Example:
+     tool: code_search
+     reason: I need to find all code snippets related to graph generation in Python files under 'src/'
+     params:
+       query: How graph is generated for the python codebase
+       include_pattern: "src/.*\\.py"
+       class_contexts: [".*graph.*"]
+       top_k: 5
+       
+8. finish: End the process and provide final response
    - No parameters required
    - Example:
      tool: finish
@@ -254,7 +293,7 @@ Available tools:
 
 Respond with a YAML object containing:
 ```yaml
-tool: one of: read_file, edit_file, delete_file, grep_search, list_dir, list_code_elements, finish
+tool: one of: read_file, edit_file, delete_file, grep_search, list_dir, list_code_elements, code_search, finish
 reason: |
   detailed explanation of why you chose this tool and what you intend to do
   if you chose finish, explain why no more actions are needed
@@ -264,6 +303,12 @@ params:
 
 IMPORTANT NOTE :
 - In the grep_search tool query will the regex pattern you want to search on.
+- In the code_search tool, query can be natural language or code. Performs semantic search using embeddings to find conceptually related code, even if exact terms differ.
+    - include_pattern: Regex filter for file paths.
+    - class_contexts: Only return results defined under matching class names.
+- grep vs code_search
+    - Use grep_search for exact keyword/pattern matches.
+    - Use code_search when you know the functionality or behavior but not the exact text.
 - After finish tool we have a seperate agent , which will format the answer correclty on the basis of past history
 - reason should be valid, concise and parsable by yaml
 - STRICTLY FOLLOW THE OUTPUT FORMAT
@@ -612,9 +657,6 @@ class ListCodeElementsNode(Node):
         )
     
     def post(self, shared: Dict[str, Any], prep_res: Dict[str, Any], exec_res: Tuple[bool, List[Dict[str, Any]]]) -> str:
-        print("######################################")
-        print(exec_res)
-        print("#####################################")
         matches, success = exec_res
         
         # Update the result in the last history entry
@@ -623,6 +665,68 @@ class ListCodeElementsNode(Node):
             history[-1]["result"] = {
                 "success": success,
                 "matches": matches
+            }
+ 
+#############################################
+# Code Search Node
+#############################################
+class CodeSearchNode(Node):
+    def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
+        # Get parameters from the last history entry
+        history = shared.get("history", [])
+        if not history:
+            raise ValueError("No history found")
+        
+        last_action = history[-1]
+        params = last_action["params"]
+        
+        # Use the reason for logging instead of explanation
+        reason = last_action.get("reason", "No reason provided")
+        logger.info(f"CodeSearchNode: {reason}")
+        
+        # Ensure paths are relative to working directory
+        working_dir = shared.get("working_dir", "")
+        
+        return {
+            "query": params.get("query"),
+            "include_pattern": params.get("include_pattern"),
+            "class_contexts": params.get("class_contexts"),
+            "top_k": params.get("top_k", 10),
+            "working_dir": working_dir,
+            "driver": driver
+        }
+    
+    def exec(self, params: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
+        # Use current directory if not specified
+        working_dir = params.pop("working_dir", "")
+        driver = params.pop("driver", None)
+        
+        if not driver or not sementic_seacher:
+            return [], False
+            
+        try:
+            results = sementic_seacher.semantic_search_with_propagation(
+                working_dir=working_dir,
+                query=params["query"],
+                file_names=[params.get("include_pattern")] if params.get("include_pattern") else None,
+                class_contexts=params.get("class_contexts"),
+                top_k=params.get("top_k", 10)
+            )
+            return results, True
+            
+        except Exception as e:
+            logger.error(f"Code search error: {str(e)}")
+            return [], False
+    
+    def post(self, shared: Dict[str, Any], prep_res: Dict[str, Any], exec_res: Tuple[bool, List[Dict[str, Any]]]) -> str:
+        results, success = exec_res
+        
+        # Update the result in the last history entry
+        history = shared.get("history", [])
+        if history:
+            history[-1]["result"] = {
+                "success": success,
+                "results": results
             }
  
 #############################################
@@ -900,12 +1004,14 @@ def create_edit_agent() -> Flow:
 #############################################
 # Main Flow
 #############################################
-def create_main_flow(graphrag : bool = True) -> Flow:
-    global driver
+def create_main_flow(graphrag : bool, model : str) -> Flow:
+    global driver, sementic_seacher
     
     if graphrag:
         driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
         create_schema() 
+        sementic_seacher = _initialize_semantic_searcher(driver, model)
+        
     # Create nodes
     main_agent = MainDecisionAgent()
     read_action = ReadFileAction()
@@ -915,6 +1021,7 @@ def create_main_flow(graphrag : bool = True) -> Flow:
     edit_agent = create_edit_agent()
     format_response = FormatResponseNode()
     list_code_elements = ListCodeElementsNode()
+    code_search = CodeSearchNode()
     
     # Connect main agent to action nodes
     main_agent - "read_file" >> read_action
@@ -924,6 +1031,7 @@ def create_main_flow(graphrag : bool = True) -> Flow:
     main_agent - "edit_file" >> edit_agent
     main_agent - "finish" >> format_response
     main_agent - "list_code_elements" >> list_code_elements
+    main_agent - "code_search" >> code_search
     # Connect action nodes back to main agent using default action
     read_action >> main_agent
     grep_action >> main_agent
@@ -931,6 +1039,7 @@ def create_main_flow(graphrag : bool = True) -> Flow:
     delete_action >> main_agent
     edit_agent >> main_agent
     list_code_elements >> main_agent
+    code_search >> main_agent
     
     # Create flow
     return Flow(start=main_agent)
