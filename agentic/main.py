@@ -26,6 +26,8 @@ def main():
                         help='Working directory for file operations (default: current directory)')
     parser.add_argument('--graphrag', '-g', type=bool, default=True, 
                         help='whether to use graph rag search while finding code snippets')
+    parser.add_argument('--model', '-m', type=str, default="Salesforce/SFR-Embedding-Code-400M_R", 
+                        help='Model to use for the sementic code search')
     args = parser.parse_args()
     
     # If no query provided via command line, ask for it
@@ -40,7 +42,7 @@ def main():
         "graphrag" : args.graphrag,
         "response": None
     }
-    coding_agent_flow = create_main_flow(args.graphrag)
+    coding_agent_flow = create_main_flow(args.graphrag, args.model)
     while user_query:
     
         # Initialize shared memory
