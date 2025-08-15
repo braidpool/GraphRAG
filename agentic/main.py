@@ -5,6 +5,7 @@ from pathlib import Path
 from flow import create_main_flow
 from utils.graph_creator import GraphBuilder
 from utils.ContextManager import ContextManager
+from flow import create_main_flow
 
 # Set up logging
 logging.basicConfig(
@@ -17,6 +18,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger('main')
+
 
 def validate_path_in_working_dir(path: str, working_dir: str) -> bool:
     """
@@ -121,6 +123,7 @@ def main():
                         help='whether to use graph rag search while finding code snippets')
     parser.add_argument('--model', '-m', type=str, default="Salesforce/SFR-Embedding-Code-400M_R", 
                         help='Model to use for the sementic code search')
+
     parser.add_argument('--create-graph', '-c', type=str, 
                         help='Path to file or folder to add to the graph')
     args = parser.parse_args()
