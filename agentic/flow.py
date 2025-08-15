@@ -92,7 +92,9 @@ def format_history_summary(history: List[Dict[str, Any]]) -> str:
         # Header for all entries - removed timestamp
         history_str += f"Action {i+1}:\n"
         history_str += f"- Tool: {action['tool']}\n"
-        history_str += f"- Reason: {action['reason']}\n"
+        reason = action.get("reason", None)
+        if reason :
+            history_str += f"- Reason: {action['reason']}\n"
         
         # Add parameters
         params = action.get("params", {})
